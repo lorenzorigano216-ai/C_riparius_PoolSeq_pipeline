@@ -1,0 +1,299 @@
+# Workflow for C. riparius (E&R Experiment)
+# Author: Lorenzo Rigano
+# Year: 2024
+
+===============================================================================
+SOFTWARE & VERSIONS
+- Trimmomatic v0.39
+- FastQC v0.11.9
+- PEAR v0.9.11 (optional merging)
+- BWA mem v0.7.17
+- Samtools v1.10
+- Picard v2.20.8
+- Qualimap v2.2.1 (optional)
+- PoPoolation v1.2.2
+- PoPoolation2 v1201
+- PoolSeq R package v0.3.5
+- TopGO R package v4.4
+- R v4.x
+===============================================================================
+
+# DATA AVAILABILITY
+# Raw sequencing data and pool mapping files are available at ENA accession PRJEB89250
+# Metadata and non-genomic data should also be deposited alongside scripts on GitHub
+
+########################
+# 1. Raw Data Processing
+########################
+
+## Trimming with Trimmomatic
+trimmomatic PE -threads 8 -phred33 \
+  XX_1.fq.gz XX_2.fq.gz \
+  XX_1P.fq.gz XX_1U.fq.gz XX_2P.fq.gz XX_2U.fq.gz \
+  ILLUMINACLIP:adapter.fa:2:30:10:8:true \
+  HEADCROP:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:20 MINLEN:100 TOPHRED33
+
+fastqc XX_1P.fq.gz XX_2P.fq.gz
+
+# Optional: merge overlapping paired-end reads
+pear -f XX_1P.fq.gz -r XX_2P.fq.gz -o XX_merged_reads
+
+## Mapping with BWA mem
+bwa index Criparius_v4.fasta
+
+bwa mem -t 10 -k 30 Criparius_v4.fasta XX.assembled.fastq | samtools sort -l 9 -O BAM -o XX.assembled.sort.bam
+bwa mem -t 10 -k 30 Criparius_v4.fasta XX.unassembled.forward.fastq XX.unassembled.reverse.fastq | samtools sort -l 9 -O BAM -o XX.unassembled.sort.bam
+samtools merge XX.sort.bam XX.assembled.sort.bam XX.unassembled.sort.bam
+
+samtools flagstat *.sort.bam > all_samples.flagstat.txt
+# Optional: Qualimap BAMQC
+
+########################
+# 2. Duplicate Removal & Filtering
+########################
+
+picard MarkDuplicates I=XX.sort.bam O=XX.sort.rmd.bam M=XX.dupstat.txt VALIDATION_STRINGENCY=SILENT REMOVE_DUPLICATES=true
+picard SortSam I=XX.sort.rmd.bam O=XX.sort.rmd.sorted.bam SORT_ORDER=coordinate
+picard BuildBamIndex I=XX.sort.rmd.sorted.bam
+
+# Filter for proper pairs, MAPQ >=20
+samtools view -q 20 -f 0x0002 -F 0x0004 -F 0x0008 -b XX.sort.rmd.sorted.bam > XX.sort.rmd.q20.bam
+samtools index XX.sort.rmd.q20.bam
+
+# Coverage filtering
+samtools depth *.sort.rmd.q20.bam | awk '{print $3}' > sample.coverage
+
+########################
+# 3. SNP Calling & Sync Files (PoPoolation2)
+########################
+
+samtools mpileup -B -f Criparius_v4.fasta *.sort.rmd.q20.bam > chiro_pool.mpileup
+
+perl /software/popoolation2_1201/mpileup2sync.pl \
+  --input chiro_pool.mpileup \
+  --output chiro_pool.sync \
+  --fastq-type sanger \
+  --min-qual 20
+
+# Indel removal
+perl /software/popoolation2_1201/indel_filtering/identify-indel-regions.pl \
+  --indel-window 5 --min-count 2 \
+  --input chiro_pool.mpileup \
+  --output chiro_pool.indels.gtf
+
+perl /software/popoolation2_1201/filter-sync-by-gtf.pl \
+  --input chiro_pool.sync \
+  --gtf chiro_pool.indels.gtf \
+  --output chiro_pool.idf.sync
+
+########################
+# 4. FST & Fisher Exact Test
+########################
+
+perl /software/popoolation2_1201/fst-sliding.pl \
+  --input chiro_pool.idf.sync \
+  --output chiro_pool.fst \
+  --min-count 3 --min-coverage 15 --max-coverage 2% \
+  --pool-size 100 \
+  --window-size 1000 --step-size 1000 \
+  --min-covered-fraction 0.5
+
+perl /software/popoolation2_1201/fisher-test.pl \
+  --input chiro_pool.idf.sync \
+  --output chiro_pool.fet \
+  --min-count 2 --min-coverage 15 --max-coverage 2% \
+  --min-covered-fraction 0.5 --window-size 1000 --step-size 1000
+
+########################
+# 5. Nucleotide Diversity (PoPoolation)
+########################
+
+perl /software/popoolation/Variance-sliding.pl \
+  --input XX.idf.ss15.mpileup \
+  --measure pi \
+  --fastq-type sanger \
+  --min-count 3 --min-coverage 15 --max-coverage 50 \
+  --pool-size 120 --window-size 1000 --step-size 1000 \
+  --output XX.1kb.pi
+
+perl /software/popoolation/Variance-sliding.pl \
+  --input XX.idf.ss15.mpileup \
+  --measure theta \
+  --fastq-type sanger \
+  --min-count 3 --min-coverage 15 --max-coverage 50 \
+  --pool-size 120 --window-size 1000 --step-size 1000 \
+  --output XX.1kb.theta
+
+########################
+# 6. AFC Calculation & Drift Simulation (PoolSeq)
+########################
+
+# Load PoolSeq data: 3 replicates, generations 0 to 7
+Pool_Rot <- read.sync(file="chiro_pool_rot.idf.sync", 
+                      gen = 0:7, 
+                      repl = 1:3, 
+                      keepOnlyBiallelic = TRUE)
+
+# Example: calculate allele frequencies and coverage for replicate 1
+rep <- 1   # choose which replicate
+gen0 <- 0  # starting generation
+gen7 <- 7  # final generation
+
+af_rot_gen0 <- af(sync = Pool_Rot, repl = rep, gen = gen0)
+cov_rot_gen0 <- coverage(sync = Pool_Rot, repl = rep, gen = gen0)
+
+af_rot_gen7 <- af(sync = Pool_Rot, repl = rep, gen = gen7)
+cov_rot_gen7 <- coverage(sync = Pool_Rot, repl = rep, gen = gen7)
+
+# Estimate effective population size (Ne) for this replicate
+Ne_Rot <- estimateNe(p0 = af_rot_gen0, pt = af_rot_gen7, 
+                     cov0 = cov_rot_gen0, covt = cov_rot_gen7, 
+                     t = gen7 - gen0, Ncensus = 100, 
+                     poolSize = c(100,100))  # pool sizes if different, adjust
+
+# Wright-Fisher drift simulation
+exp_Rot <- wf.traj(p0 = af_rot_gen0, Ne = Ne_Rot, t = 0:7, haploid = FALSE)
+
+# Chi-square test observed vs expected drift
+drift_gen0 <- t(cov_rot_gen0 * exp_Rot[,1])
+drift_gen0_afc <- cov_rot_gen0 - drift_gen0
+
+AF_0 <- t(cov_rot_gen0 * af_rot_gen0)
+af_0 <- cov_rot_gen0 - AF_0
+
+p.values.drift <- chi.sq.test(A0 = AF_0, a0 = af_0, 
+                              At = drift_gen0, at = drift_gen0_afc, 
+                              min.cov = 15, max.cov = 70, min.cnt = 1, log = TRUE)
+
+p.values.drift <- chi.sq.test(A0=AF_0, a0=af_0, At=drift_rot_gen0, at=drift_rot_gen0_afc, min.cov=15, max.cov=70, min.cnt=1, log=TRUE)
+
+########################
+# 7. Monte Carlo Intersection of Haplotypes
+########################
+
+set.seed(123)
+N <- 64
+draws <- c(46,36,42)
+n_sim <- 100000
+observed <- c(p000=0, p001=9, p010=1, p100=2, p011=15, p101=17, p110=12, p111=8)
+
+sim_res <- replicate(n_sim, {
+  g1 <- sample(N, draws[1])
+  g2 <- sample(N, draws[2])
+  g3 <- sample(N, draws[3])
+  table(factor(paste0(as.integer(1:N %in% g1),
+                      as.integer(1:N %in% g2),
+                      as.integer(1:N %in% g3)),
+               levels=names(observed)))
+})
+
+mean_expected <- rowMeans(sim_res)
+min_sim <- apply(sim_res,1,min)
+max_sim <- apply(sim_res,1,max)
+p_values <- sapply(1:length(observed), function(i) mean(sim_res[i,] >= observed[i]))
+
+results <- data.frame(pattern=names(observed),
+                      observed,
+                      mean_expected,
+                      min_sim,
+                      max_sim,
+                      p=p_values)
+write.csv(results, "monte_carlo_haplotypes.csv", row.names=FALSE)
+
+########################
+# 8. TopGO Enrichment
+########################
+
+library(topGO)
+library(ggplot2)
+
+GOdata <- new("topGOdata",
+              ontology="BP",
+              allGenes=geneList,
+              annot=annFUN.gene2GO,
+              gene2GO=gene2GO)
+
+resultFisher <- runTest(GOdata, algorithm="classic", statistic="fisher")
+
+resultTable <- GenTable(GOdata,
+                        classicFisher=resultFisher,
+                        topNodes=100,
+                        numChar=100)
+write.csv(resultTable, "topGO_results.csv", row.names=FALSE)
+
+# Plot top 20 GO terms
+topGO_plot <- head(resultTable,20)
+ggplot(topGO_plot, aes(x=reorder(Term,-as.numeric(classicFisher)),
+                       y=-log10(as.numeric(classicFisher)))) +
+  geom_bar(stat="identity", fill="steelblue") +
+  coord_flip() +
+  labs(x="GO Term", y="-log10(p-value)", title="TopGO Enrichment") +
+  theme_minimal()
+ggsave("topGO_barplot.pdf", width=8, height=6)
+
+########################
+# 9. Life-Cycle Analysis (R)
+########################
+
+# Load libraries
+library(ggplot2)
+library(dplyr)
+library(segmented)
+
+# Load life-cycle data (CSV with Generation, Replicate, Treatment, Mortality, EmT50, Fertility, PGR)
+lc_data <- read.csv("life_cycle_data.csv")
+
+# Function to fit models and extract R² and p-value
+fit_models <- function(df, response){
+  models <- list(
+    linear = lm(as.formula(paste(response, "~ Generation")), data=df),
+    poly2  = lm(as.formula(paste(response, "~ poly(Generation,2)")), data=df),
+    poly3  = lm(as.formula(paste(response, "~ poly(Generation,3)")), data=df)
+  )
+  res <- lapply(models, function(m){
+    s <- summary(m)
+    c(R2 = s$r.squared, p = anova(m)[1,"Pr(>F)"])
+  })
+  res_df <- do.call(rbind, res)
+  return(res_df)
+}
+
+# Loop over endpoints and treatments
+endpoints <- c("Mortality","EmT50","Fertility","PGR")
+treatments <- unique(lc_data$Treatment)
+results <- list()
+
+for(ep in endpoints){
+  for(tr in treatments){
+    df_sub <- lc_data %>% filter(Treatment==tr)
+    results[[paste(ep,tr,sep="_")]] <- fit_models(df_sub, ep)
+  }
+}
+
+# Save model summaries
+saveRDS(results, "life_cycle_model_summary.rds")
+write.csv(do.call(rbind, lapply(results, as.data.frame)), "life_cycle_model_summary.csv")
+
+# Plot endpoints with replicate points, linear/poly2/poly3/loess smoothing
+for(ep in endpoints){
+  p <- ggplot(lc_data, aes_string(x="Generation", y=ep, color="Treatment")) +
+    geom_point(aes(shape=factor(Replicate)), size=2) +
+    geom_smooth(method="lm", se=FALSE, formula=y~x) +
+    geom_smooth(method="lm", se=FALSE, formula=y~poly(x,2), linetype="dashed") +
+    geom_smooth(method="loess", se=FALSE, linetype="dotted") +
+    labs(title=paste("Life-cycle endpoint:", ep),
+         x="Generation", y=ep) +
+    theme_minimal()
+  ggsave(paste0(ep,"_life_cycle_plot.pdf"), plot=p, width=8, height=6)
+}
+
+# Segmented linear model example for PGR (if needed)
+pgr_data <- lc_data %>% filter(Treatment=="Control")
+lm_pgr <- lm(PGR ~ Generation, data=pgr_data)
+seg_pgr <- segmented(lm_pgr, seg.Z = ~Generation, psi=list(Generation=3))
+summary(seg_pgr)
+plot(seg_pgr
+
+===============================================================================
+END OF PIPELINE
+===============================================================================
